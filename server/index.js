@@ -112,6 +112,225 @@ app.get('/api/public/:communitySlug/calendar', dbRequired, async (req,res) => {
   }catch(error){console.error('public calendar read failed',error.message);res.status(500).json({error:'Unable to load community calendar.'})}
 });
 
+
+// ---------------------------------------------------------------- votes
+// One member, one vote, one time. The unique index is the real guard: a second
+// attempt gets 409 and the existing record is returned, never overwritten.
+app.get('/api/public/cases/:caseRef/vote', dbRequired, async (req,res) => {
+  const { memberId } = req.query;
+  if(!memberId) return res.status(400).json({error:'memberId is required.'});
+  try{
+    const found = await pool.query(`SELECT v.vote, v.voted_at, v.vote_source
+      FROM case_votes v JOIN support_requests r ON r.id=v.request_id
+      WHERE (r.case_number=$1 OR r.id::text=$1) AND v.member_id=$2`, [req.params.caseRef, memberId]);
+    if(!found.rowCount) return res.json({voted:false});
+    res.set('Cache-Control','no-store');
+    res.json({voted:true, vote:found.rows[0].vote, votedAt:found.rows[0].voted_at, source:found.rows[0].vote_source});
+  }catch(error){console.error('vote read failed',error.message);res.status(500).json({error:'Unable to read the vote record.'})}
+});
+
+app.post('/api/public/cases/:caseRef/vote', dbRequired, async (req,res) => {
+  const { memberId, vote='support', deviceFingerprint=null } = req.body||{};
+  if(!memberId) return res.status(400).json({error:'memberId is required to vote.'});
+  if(!['support','do_not_support','abstain'].includes(vote)) return res.status(400).json({error:'Unsupported vote value.'});
+  const client = await pool.connect();
+  try{
+    await client.query('BEGIN');
+    const record = await client.query(`SELECT r.id,r.community_id,r.case_number,r.status FROM support_requests r
+      WHERE r.case_number=$1 OR r.id::text=$1 FOR UPDATE`, [req.params.caseRef]);
+    if(!record.rowCount){await client.query('ROLLBACK');return res.status(404).json({error:'Case not found.'})}
+    const request = record.rows[0];
+    if(['closed','declined','distributed'].includes(request.status)){
+      await client.query('ROLLBACK');
+      return res.status(409).json({error:'Voting is closed for this case.',reason:'case_closed'});
+    }
+    const member = await client.query(`SELECT m.id FROM members m
+      JOIN community_memberships cm ON cm.member_id=m.id
+      WHERE m.id=$1 AND cm.community_id=$2 AND cm.status='active'
+      AND m.onboarding_status='approved' LIMIT 1`, [memberId, request.community_id]);
+    if(!member.rowCount){await client.query('ROLLBACK');return res.status(403).json({error:'Only active community members may vote.',reason:'not_a_member'})}
+
+    const existing = await client.query('SELECT vote, voted_at FROM case_votes WHERE request_id=$1 AND member_id=$2', [request.id, memberId]);
+    if(existing.rowCount){
+      await client.query('COMMIT');
+      return res.status(409).json({
+        error:'This member has already voted on this case. Votes cannot be repeated or changed.',
+        reason:'duplicate_vote',
+        vote:existing.rows[0].vote,
+        votedAt:existing.rows[0].voted_at
+      });
+    }
+    const inserted = await client.query(`INSERT INTO case_votes(request_id,member_id,vote,voted_at,voter_community_id,vote_source,device_fingerprint)
+      VALUES($1,$2,$3,now(),$4,'portal',$5) RETURNING vote,voted_at`,[request.id,memberId,vote,request.community_id,deviceFingerprint]);
+    await client.query(`INSERT INTO audit_log(actor_id,community_id,action,entity_type,entity_id,metadata)
+      VALUES($1,$2,'case_vote_recorded','support_request',$3,$4)`,[memberId,request.community_id,request.id,JSON.stringify({vote,caseNumber:request.case_number})]);
+    await client.query('COMMIT');
+    res.status(201).json({recorded:true, vote:inserted.rows[0].vote, votedAt:inserted.rows[0].voted_at, locked:true});
+  }catch(error){
+    await client.query('ROLLBACK');
+    if(error.code==='23505') return res.status(409).json({error:'This member has already voted on this case.',reason:'duplicate_vote'});
+    console.error('vote write failed',error.message);
+    res.status(500).json({error:'Unable to record the vote.'});
+  }finally{client.release()}
+});
+
+// ------------------------------------------------------------ campaigns
+app.get('/api/public/:communitySlug/campaigns', dbRequired, async (req,res) => {
+  try{
+    const c=await pool.query('SELECT id FROM communities WHERE slug=$1 AND enabled=true',[req.params.communitySlug]);
+    if(!c.rowCount)return res.status(404).json({error:'Community not found.'});
+    const rows=await pool.query(`SELECT cp.id,cp.campaign_number,cp.title,cp.public_story,cp.currency_code,cp.target_amount,cp.raised_amount,
+        cp.disbursed_amount,cp.status,cp.window_end,cp.percent_funded,r.case_number,p.name program_name
+      FROM public_campaign_progress cp
+      LEFT JOIN support_requests r ON r.id=cp.request_id
+      LEFT JOIN programs p ON p.id=cp.program_id
+      WHERE cp.community_id=$1 ORDER BY cp.status, cp.window_end`,[c.rows[0].id]);
+    res.set('Cache-Control','no-store');res.json({campaigns:rows.rows});
+  }catch(error){console.error('campaign read failed',error.message);res.status(500).json({error:'Unable to load campaigns.'})}
+});
+
+app.post('/api/admin/communities/:communitySlug/campaigns', adminOnly, dbRequired, async (req,res) => {
+  const {memberId,title,publicStory='',targetAmount,caseRef,programId,durationDays=30,monthlyPoolContribution=0,externalCampaignUrl=null}=req.body||{};
+  if(!memberId||!title?.trim()||!Number.isFinite(Number(targetAmount))||Number(targetAmount)<=0)return res.status(400).json({error:'memberId, title, and a positive targetAmount are required.'});
+  const client=await pool.connect();
+  try{
+    await client.query('BEGIN');
+    const c=await client.query('SELECT cm.id,co.currency_code FROM communities cm JOIN countries co ON co.id=cm.country_id WHERE cm.slug=$1',[req.params.communitySlug]);
+    if(!c.rowCount){await client.query('ROLLBACK');return res.status(404).json({error:'Community not found.'})}
+    const community=c.rows[0];
+    if(!await assertCommunityAdmin(client,community.id,memberId)){await client.query('ROLLBACK');return res.status(403).json({error:'Active community admin membership required.'})}
+    let requestId=null;
+    if(caseRef){const found=await client.query('SELECT id FROM support_requests WHERE (case_number=$1 OR id::text=$1) AND community_id=$2',[caseRef,community.id]);requestId=found.rows[0]?.id||null}
+    const number=`CMP-${new Date().getFullYear()}${String(Date.now()).slice(-4)}`;
+    const created=await client.query(`INSERT INTO fundraising_campaigns(community_id,request_id,program_id,campaign_number,title,public_story,currency_code,target_amount,monthly_pool_contribution,external_campaign_url,window_end,status,created_by)
+      VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,current_date + ($11::int),'awaiting_board',$12)
+      RETURNING id,campaign_number,title,target_amount,status,window_end`,
+      [community.id,requestId,programId||null,number,title.trim(),publicStory,community.currency_code,Number(targetAmount),Number(monthlyPoolContribution)||0,externalCampaignUrl,Number(durationDays)||30,memberId]);
+    await client.query(`INSERT INTO audit_log(actor_id,community_id,action,entity_type,entity_id,metadata) VALUES($1,$2,'campaign_created','fundraising_campaign',$3,$4)`,
+      [memberId,community.id,created.rows[0].id,JSON.stringify({targetAmount:Number(targetAmount),caseRef:caseRef||null})]);
+    await client.query('COMMIT');
+    // Drafts must never be published automatically; the board decides.
+    res.status(201).json({campaign:created.rows[0],note:'Campaign created as awaiting_board. A board decision is required before donors can contribute.'});
+  }catch(error){await client.query('ROLLBACK');console.error('campaign create failed',error.message);res.status(400).json({error:'Unable to create the campaign.'})}
+  finally{client.release()}
+});
+
+// ------------------------------------------------------------ documents
+app.get('/api/admin/cases/:caseRef/documents', adminOnly, dbRequired, async (req,res) => {
+  const {memberId}=req.query;
+  if(!memberId)return res.status(400).json({error:'memberId is required.'});
+  try{
+    const record=await pool.query('SELECT id,community_id FROM support_requests WHERE case_number=$1 OR id::text=$1',[req.params.caseRef]);
+    if(!record.rowCount)return res.status(404).json({error:'Case not found.'});
+    if(!await assertCommunityAdmin(pool,record.rows[0].community_id,memberId))return res.status(403).json({error:'Active community admin membership required.'});
+    const docs=await pool.query(`SELECT id,file_name,mime_type,byte_size,document_type,visibility,storage_provider,drive_file_id,sync_status,created_at
+      FROM case_documents WHERE request_id=$1 AND deleted_at IS NULL ORDER BY created_at DESC`,[record.rows[0].id]);
+    res.set('Cache-Control','no-store');res.json({documents:docs.rows});
+  }catch(error){console.error('document read failed',error.message);res.status(500).json({error:'Unable to load case documents.'})}
+});
+
+// Metadata is registered here; the binary is uploaded by an approved storage adapter
+// (Google Drive with drive.file scope) which then PATCHes the drive file id.
+app.post('/api/admin/cases/:caseRef/documents', adminOnly, dbRequired, async (req,res) => {
+  const {memberId,fileName,mimeType,byteSize,documentType='other',visibility='admins',reviewerNote='',storageProvider='google_drive',driveFolderPath=null}=req.body||{};
+  if(!memberId||!fileName?.trim())return res.status(400).json({error:'memberId and fileName are required.'});
+  if(!['case_evidence','identity','quote_invoice','voucher','board_pack','campaign_material','other'].includes(documentType))return res.status(400).json({error:'Unsupported documentType.'});
+  if(!['admins','board','public'].includes(visibility))return res.status(400).json({error:'Unsupported visibility.'});
+  const client=await pool.connect();
+  try{
+    await client.query('BEGIN');
+    const record=await client.query('SELECT id,community_id FROM support_requests WHERE case_number=$1 OR id::text=$1',[req.params.caseRef]);
+    if(!record.rowCount){await client.query('ROLLBACK');return res.status(404).json({error:'Case not found.'})}
+    const {id:requestId,community_id:communityId}=record.rows[0];
+    if(!await assertCommunityAdmin(client,communityId,memberId)){await client.query('ROLLBACK');return res.status(403).json({error:'Active community admin membership required.'})}
+    const drive=await client.query('SELECT google_drive_account,google_drive_folder FROM community_master_settings WHERE community_id=$1',[communityId]);
+    const hasDrive=!!drive.rows[0]?.google_drive_account;
+    const created=await client.query(`INSERT INTO case_documents(community_id,request_id,uploaded_by,file_name,mime_type,byte_size,document_type,visibility,reviewer_note,storage_provider,drive_folder_path,sync_status)
+      VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING id,file_name,sync_status,storage_provider`,
+      [communityId,requestId,memberId,fileName.trim(),mimeType||null,Number(byteSize)||null,documentType,visibility,reviewerNote||null,
+       hasDrive?storageProvider:'browser',driveFolderPath||drive.rows[0]?.google_drive_folder||null,hasDrive?'pending':'local_only']);
+    await client.query(`INSERT INTO audit_log(actor_id,community_id,action,entity_type,entity_id,metadata) VALUES($1,$2,'case_document_attached','case_document',$3,$4)`,
+      [memberId,communityId,created.rows[0].id,JSON.stringify({requestId,documentType,visibility,hasDrive})]);
+    await client.query('COMMIT');
+    res.status(201).json({document:created.rows[0],driveConnected:hasDrive});
+  }catch(error){await client.query('ROLLBACK');console.error('document write failed',error.message);res.status(400).json({error:'Unable to attach the document.'})}
+  finally{client.release()}
+});
+
+// ------------------------------------------------------------- ballpark
+app.get('/api/admin/communities/:communitySlug/ballpark', adminOnly, dbRequired, async (req,res) => {
+  const {memberId}=req.query;
+  if(!memberId)return res.status(400).json({error:'memberId is required.'});
+  try{
+    const c=await pool.query('SELECT id FROM communities WHERE slug=$1',[req.params.communitySlug]);
+    if(!c.rowCount)return res.status(404).json({error:'Community not found.'});
+    if(!await assertCommunityAdmin(pool,c.rows[0].id,memberId))return res.status(403).json({error:'Active community admin membership required.'});
+    const rows=await pool.query(`SELECT b.id,p.name program_name,b.period_start,b.period_end,b.currency_code,b.available_funds,
+      b.reserve_percent,b.ballpark_percent,b.ballpark_amount,b.quick_action_amount,
+      coalesce((SELECT sum(l.amount) FROM ledger_transactions l WHERE l.program_id=p.id AND l.entry_type='disbursement' AND l.occurred_at::date BETWEEN b.period_start AND b.period_end),0)::numeric(18,2) dispatched_in_period
+      FROM program_ballpark_allocations b JOIN programs p ON p.id=b.program_id
+      WHERE b.community_id=$1 ORDER BY p.name`,[c.rows[0].id]);
+    res.set('Cache-Control','no-store');
+    res.json({planning_only:true,note:'Ballpark figures are planning estimates. They never authorise a disbursement.',allocations:rows.rows});
+  }catch(error){console.error('ballpark read failed',error.message);res.status(500).json({error:'Unable to load ballpark allocations.'})}
+});
+
+app.post('/api/admin/communities/:communitySlug/ballpark', adminOnly, dbRequired, async (req,res) => {
+  const {memberId,periodStart,periodEnd,availableFunds,reservePercent=15,quickActionAmount=0,allocations=[]}=req.body||{};
+  const iso=/^\d{4}-\d{2}-\d{2}$/;
+  if(!memberId||!iso.test(periodStart||'')||!iso.test(periodEnd||'')||periodStart>periodEnd)return res.status(400).json({error:'memberId and a valid period are required.'});
+  if(!Array.isArray(allocations)||!allocations.length)return res.status(400).json({error:'Provide at least one program allocation.'});
+  const client=await pool.connect();
+  try{
+    await client.query('BEGIN');
+    const c=await client.query('SELECT id FROM communities WHERE slug=$1',[req.params.communitySlug]);
+    if(!c.rowCount){await client.query('ROLLBACK');return res.status(404).json({error:'Community not found.'})}
+    const communityId=c.rows[0].id;
+    if(!await assertCommunityAdmin(client,communityId,memberId)){await client.query('ROLLBACK');return res.status(403).json({error:'Active community admin membership required.'})}
+    for(const row of allocations){
+      if(!row.programId||!Number.isFinite(Number(row.ballparkPercent)))continue;
+      await client.query(`INSERT INTO program_ballpark_allocations(community_id,program_id,period_start,period_end,currency_code,available_funds,reserve_percent,ballpark_percent,quick_action_amount,created_by)
+        SELECT $1,$2,$3,$4,co.currency_code,$5,$6,$7,$8,$9 FROM communities cm JOIN countries co ON co.id=cm.country_id WHERE cm.id=$1
+        ON CONFLICT(program_id,period_start,period_end) DO UPDATE SET available_funds=EXCLUDED.available_funds,reserve_percent=EXCLUDED.reserve_percent,ballpark_percent=EXCLUDED.ballpark_percent,quick_action_amount=EXCLUDED.quick_action_amount,updated_at=now()`,
+        [communityId,row.programId,periodStart,periodEnd,Number(availableFunds)||0,Number(reservePercent)||0,Number(row.ballparkPercent)||0,Number(quickActionAmount)||0,memberId]);
+    }
+    await client.query(`INSERT INTO audit_log(actor_id,community_id,action,entity_type,metadata) VALUES($1,$2,'ballpark_plan_saved','community',$3)`,
+      [memberId,communityId,JSON.stringify({periodStart,periodEnd,availableFunds:Number(availableFunds)||0,programs:allocations.length})]);
+    await client.query('COMMIT');
+    res.json({saved:true,planning_only:true});
+  }catch(error){await client.query('ROLLBACK');console.error('ballpark write failed',error.message);res.status(400).json({error:'Unable to save the ballpark plan.'})}
+  finally{client.release()}
+});
+
+// ---------------------------------------------------------- communities
+app.get('/api/public/communities', dbRequired, async (_req,res) => {
+  try{
+    const rows=await pool.query(`SELECT c.slug,c.name,c.short_code,c.state_region,c.city,co.code country_code,co.currency_code
+      FROM communities c JOIN countries co ON co.id=c.country_id WHERE c.enabled=true ORDER BY c.name`);
+    res.set('Cache-Control','no-store');res.json({communities:rows.rows});
+  }catch(error){console.error('community list failed',error.message);res.status(500).json({error:'Unable to load communities.'})}
+});
+
+// ------------------------------------------------------------- language
+app.get('/api/public/languages', dbRequired, async (_req,res) => {
+  try{
+    const rows=await pool.query('SELECT code,label,direction,interface_supported,enabled FROM portal_languages ORDER BY enabled DESC,label');
+    res.set('Cache-Control','public, max-age=3600');res.json({languages:rows.rows});
+  }catch(error){console.error('language list failed',error.message);res.status(500).json({error:'Unable to load languages.'})}
+});
+
+// ---------------------------------------------------------- case studies
+app.get('/api/public/:communitySlug/case-studies', dbRequired, async (req,res) => {
+  try{
+    const c=await pool.query('SELECT id FROM communities WHERE slug=$1 AND enabled=true',[req.params.communitySlug]);
+    if(!c.rowCount)return res.status(404).json({error:'Community not found.'});
+    const rows=await pool.query(`SELECT study_number,title,scale,public_summary,situation,approach,verification,board_presentation,board_decision,fundraising,distribution,lessons,
+      requested_amount,collected_amount,distributed_amount
+      FROM case_studies WHERE community_id=$1 AND published=true ORDER BY created_at DESC`,[c.rows[0].id]);
+    res.set('Cache-Control','no-store');res.json({caseStudies:rows.rows});
+  }catch(error){console.error('case study read failed',error.message);res.status(500).json({error:'Unable to load case studies.'})}
+});
+
 // Admin calendar and case-monitoring tools require both the trusted API token and an active admin membership.
 async function assertCommunityAdmin(client, communityId, memberId) {
   const access=await client.query(`SELECT 1 FROM community_memberships WHERE community_id=$1 AND member_id=$2 AND role='admin' AND status='active'`,[communityId,memberId]);
