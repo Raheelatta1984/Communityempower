@@ -21,7 +21,7 @@ const pool = new Pool({
   connectionTimeoutMillis: 10000,
   idleTimeoutMillis: 1000,
 });
-const migrations = ['db/schema.sql', 'db/upgrade-2026-11-budget-master.sql'];
+const migrations = ['db/schema.sql', 'db/upgrade-2026-11-budget-master.sql', 'db/upgrade-2026-11-portal-tools.sql'];
 try {
   const client = await pool.connect();
   try {
