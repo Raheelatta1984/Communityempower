@@ -7,8 +7,9 @@ const { Pool } = pg;
 const app = express();
 app.disable('x-powered-by');
 app.use(express.json({ limit: '32kb' }));
-const pool = process.env.DATABASE_URL ? new Pool({
-  connectionString: process.env.DATABASE_URL,
+const databaseUrl = process.env.DATABASE_URL || process.env.MYCOMM_DATABASE_URL || process.env.MYCOMM_POSTGRES_PRISMA_URL || process.env.MYCOMM_POSTGRES_URL || process.env.MYCOMM_DATABASE_URL_UNPOOLED || process.env.MYCOMM_POSTGRES_URL_NON_POOLING;
+const pool = databaseUrl ? new Pool({
+  connectionString: databaseUrl,
   ssl: process.env.DATABASE_SSL === 'disable' ? false : { rejectUnauthorized: false },
   max: 5,
   idleTimeoutMillis: 30_000,
@@ -134,9 +135,10 @@ app.post('/api/admin/statements/run', adminOnly, dbRequired, async (req,res) => 
 });
 
 // In local development Vite proxies /api here. Production deployment should serve the built static app separately.
-if (process.env.NODE_ENV === 'production') {
+if (process.env.NODE_ENV === 'production' && !process.env.VERCEL) {
   const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../dist');
   app.use(express.static(root));
   app.get('*', (_req,res)=>res.sendFile(path.join(root,'index.html')));
 }
-app.listen(port,'0.0.0.0',()=>console.log(`Kindred API listening on 0.0.0.0:${port}`));
+if (!process.env.VERCEL) app.listen(port,'0.0.0.0',()=>console.log(`Kindred API listening on 0.0.0.0:${port}; Neon ${pool?'configured':'not configured'}`));
+export default app;
