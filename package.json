@@ -9,6 +9,7 @@
     "preview": "vite preview --host 0.0.0.0",
     "api": "node server/index.js",
     "job:collections": "node server/jobs.js collections",
+    "job:recurring-cases": "node server/jobs.js recurring-cases",
     "job:notify-statements": "node server/jobs.js notify-statements"
   },
   "dependencies": {

@@ -15,6 +15,34 @@ try {
       WHERE c.enabled=true
       ON CONFLICT(community_id,period_start) DO NOTHING RETURNING id,community_id,title,period_start`);
     console.log(JSON.stringify({job:'collections',created:result.rowCount,collections:result.rows}));
+  } else if (job === 'recurring-cases') {
+    // Run monthly. Each due installment gets a NEW submitted case number and re-enters the full review workflow.
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const due = await client.query(`SELECT rp.*,sr.country_id,sr.public_area
+        FROM case_recurrence_plans rp JOIN support_requests sr ON sr.id=rp.source_request_id
+        WHERE rp.enabled=true AND rp.next_case_month<=current_date
+          AND (rp.installment_limit IS NULL OR rp.generated_count<rp.installment_limit)
+        ORDER BY rp.next_case_month FOR UPDATE OF rp SKIP LOCKED LIMIT 200`);
+      const created=[];
+      for (const plan of due.rows) {
+        const installment=plan.generated_count+1;
+        const caseNumber=`RC-${new Date(plan.next_case_month).toISOString().slice(0,10).replaceAll('-','')}-${plan.id.slice(0,8).toUpperCase()}-${installment}`;
+        const inserted=await client.query(`INSERT INTO support_requests(case_number,community_id,program_id,requester_id,country_id,request_title,request_body,amount,currency_code,public_area,status,recurrence_plan_id,installment_number)
+          VALUES($1,$2,$3,$4,$5,$6 || ' — ' || to_char($7::date,'FMMonth YYYY'),$8,$9,$10,$11,'submitted',$12,$13)
+          ON CONFLICT(case_number) DO NOTHING RETURNING id,case_number`,[
+          caseNumber,plan.community_id,plan.program_id,plan.requester_id,plan.country_id,plan.title_template,plan.next_case_month,
+          plan.description_template,plan.installment_amount,plan.currency_code,plan.public_area,plan.id,installment
+        ]);
+        if (inserted.rowCount) created.push(inserted.rows[0]);
+        await client.query(`UPDATE case_recurrence_plans SET generated_count=generated_count+1,next_case_month=(next_case_month + interval '1 month')::date,
+          enabled=CASE WHEN installment_limit IS NOT NULL AND generated_count+1>=installment_limit THEN false ELSE enabled END WHERE id=$1`,[plan.id]);
+      }
+      await client.query('COMMIT');
+      console.log(JSON.stringify({job:'recurring-cases',created:created.length,cases:created}));
+    } catch (error) { await client.query('ROLLBACK'); throw error; }
+    finally { client.release(); }
   } else if (job === 'notify-statements') {
     // The report renderer should set status=ready and generated_at after the artifact is stored.
     // This task only queues notification records for completed statements and is safe to re-run.

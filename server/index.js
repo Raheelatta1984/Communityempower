@@ -46,6 +46,8 @@ app.get('/api/public/:communitySlug/dashboard', dbRequired, async (req, res) => 
         FROM programs p WHERE p.community_id=$1 ORDER BY p.name`, [c.id]),
       pool.query(`SELECT r.id,r.case_number,r.request_title,r.request_body,r.amount,r.currency_code,r.public_area,r.status,r.submitted_at,
         m.display_name masked_name,p.name program_name,
+        coalesce((SELECT a.board_approved_amount FROM case_board_allocations a WHERE a.request_id=r.id),0)::numeric(18,2) approved_amount,
+        coalesce((SELECT sum(dl.amount) FROM ledger_transactions dl WHERE dl.request_id=r.id AND dl.entry_type='disbursement'),0)::numeric(18,2) disbursed_amount,
         count(v.member_id) FILTER (WHERE v.vote='support')::int support_votes,
         count(v.member_id)::int total_votes
         FROM support_requests r JOIN members m ON m.id=r.requester_id JOIN programs p ON p.id=r.program_id
@@ -66,6 +68,38 @@ app.get('/api/public/:communitySlug/dashboard', dbRequired, async (req, res) => 
     res.set('Cache-Control', 'no-store');
     res.json({ community:c, programs:programs.rows, cases:requests.rows, transactions:ledger.rows, collection:collection.rows[0]||null, totals:totals.rows[0] });
   } catch (error) { console.error('dashboard query failed', error.message); res.status(500).json({ error: 'Unable to load community data.' }); }
+});
+
+app.get('/api/public/:communitySlug/budgets', dbRequired, async (req,res) => {
+  const from=req.query.from||`${new Date().getUTCFullYear()}-01-01`;
+  const to=req.query.to||`${new Date().getUTCFullYear()}-12-31`;
+  if(!/^\d{4}-\d{2}-\d{2}$/.test(from)||!/^\d{4}-\d{2}-\d{2}$/.test(to)) return res.status(400).json({error:'Use ISO calendar dates for from and to.'});
+  try {
+    const community=await pool.query('SELECT id FROM communities WHERE slug=$1 AND enabled=true',[req.params.communitySlug]);
+    if(!community.rowCount)return res.status(404).json({error:'Community not found.'});
+    const communityId=community.rows[0].id;
+    const [programs,cases]=await Promise.all([
+      pool.query(`SELECT p.id,p.slug,p.name,p.enabled,p.monthly_goal,co.currency_code,
+        coalesce(b.expected_amount,p.monthly_goal*12,0)::numeric(18,2) expected_amount,
+        coalesce(b.board_approved_amount,0)::numeric(18,2) approved_amount,
+        coalesce(d.disbursed,0)::numeric(18,2) disbursed_amount
+        FROM programs p JOIN communities cm ON cm.id=p.community_id JOIN countries co ON co.id=cm.country_id
+        LEFT JOIN LATERAL (SELECT sum(expected_amount) expected_amount,sum(board_approved_amount) board_approved_amount FROM program_budget_allocations x WHERE x.program_id=p.id AND x.period_start >= $2::date AND x.period_end <= $3::date AND x.approval_status<>'declined') b ON true
+        LEFT JOIN LATERAL (SELECT sum(amount) disbursed FROM ledger_transactions l WHERE l.program_id=p.id AND l.entry_type='disbursement' AND l.occurred_at::date BETWEEN $2::date AND $3::date) d ON true
+        WHERE p.community_id=$1 ORDER BY p.name`,[communityId,from,to]),
+      pool.query(`SELECT r.id,r.case_number,r.request_title,r.amount requested_amount,r.currency_code,r.status,r.public_area,r.submitted_at,
+        m.display_name masked_name,p.name program_name,coalesce(a.board_approved_amount,0)::numeric(18,2) approved_amount,
+        coalesce(d.disbursed,0)::numeric(18,2) disbursed_amount,r.installment_number,r.recurrence_plan_id,
+        rp.next_case_month,rp.installment_limit,rp.generated_count
+        FROM support_requests r JOIN programs p ON p.id=r.program_id JOIN members m ON m.id=r.requester_id
+        LEFT JOIN case_board_allocations a ON a.request_id=r.id
+        LEFT JOIN LATERAL (SELECT sum(l.amount) disbursed FROM ledger_transactions l WHERE l.request_id=r.id AND l.entry_type='disbursement') d ON true
+        LEFT JOIN case_recurrence_plans rp ON rp.id=r.recurrence_plan_id
+        WHERE r.community_id=$1 AND r.submitted_at::date BETWEEN $2::date AND $3::date AND r.status<>'declined'
+        ORDER BY r.submitted_at DESC`,[communityId,from,to])
+    ]);
+    res.set('Cache-Control','no-store');res.json({period:{from,to},programs:programs.rows,cases:cases.rows});
+  }catch(error){console.error('budget query failed',error.message);res.status(500).json({error:'Unable to load budget transparency.'})}
 });
 
 // Protected integration endpoints are for trusted job runners and financial reconciliation only.
