@@ -15,7 +15,7 @@ The experience falls back to clearly labelled demo data if Neon has not been con
 
 ## Neon database
 
-Create a Neon PostgreSQL project, put its pooled connection URL in `DATABASE_URL`, and apply the schema:
+The Vercel Neon integration is attached to the Vercel project and supplies `MYCOMM_DATABASE_URL`; the API and migration runner now recognize that integration variable (as well as standard `DATABASE_URL`). Vercel production/preview builds run the idempotent schema and budget/master upgrade before building the static app. For local setup, put a pooled Neon connection URL in `DATABASE_URL` and apply the schema manually:
 
 ```bash
 psql "$DATABASE_URL" -f db/schema.sql
@@ -23,6 +23,8 @@ psql "$DATABASE_URL" -f db/upgrade-2026-11-budget-master.sql
 ```
 
 The base schema creates country-specific currency precision and minimums, optional multi-country communities, masked member identities, admin-only membership approval fields, programs, central monthly GoFund collections, cases, workflow reviews, peer review, member votes, board discussion, vouchers/ledger entries, scheduled statements, notifications, and audit events. It seeds the PCIA Australia community and the four example initiatives from the community post: emergency support, funeral and burial support, a community hall, and legal support/advocacy. The budget/master upgrade adds period-based program budgets, board allocations, per-case allocations, recurring monthly case plans (each generated installment receives a new case number), and configurable portal identity/theme/social links.
+
+Vercel serves the API through `api/[...path].js`, reusing the Express routes in `server/index.js`; the browser never receives database credentials.
 
 API endpoints:
 
